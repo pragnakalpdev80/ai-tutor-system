@@ -158,7 +158,7 @@ class TutorSystem:
             return f"Solution: {solution} \n\n What do you want to learn new?"
 
         hint_prompt = f"Question: {self.question}\nStudent said: {student_answer} (Wrong).\nInstruction: {hint_instruction}"
-        hint = solution = self.model.invoke(hint_prompt).content
+        hint = self.model.invoke(hint_prompt).content
 
         return f"Not the right answer. {hint}"
 
