@@ -36,9 +36,16 @@ class StudentQuestionEvaluation(BaseModel):
         description="True ONLY if the question is strictly about Math, Science, History, or English. False if it asks for programming, coding or unrelated topics."
     )
 
+
 class Evaluation(BaseModel):
     is_correct: bool = Field(description="True if the student's answer is correct.")
     reason: str = Field(description="Why the answer passed or failed the check.")
+
+
+class UserReply(BaseModel):
+    is_new_question: bool = Field(
+        description="True if the user is asking a new question, seeking clarification, or changing the topic. False if the user is attempting to answer the tutor's current question."
+    )
 
 
 class TutorSystem:
@@ -54,7 +61,6 @@ class TutorSystem:
                 temperature=0.3,
                 api_key=api_key,
                 max_tokens=2000,
-                streaming=True
             )
 
         except Exception as e:
@@ -62,17 +68,35 @@ class TutorSystem:
             sys.exit(1)
 
         self.tools = [math, science, history, english]
-        self.model_with_tools = self.model.bind_tools(self.tools)
         self.question_verification = self.model.with_structured_output(StudentQuestionEvaluation)
         self.evaluator_model = self.model.with_structured_output(Evaluation)
+        self.user_reply = self.model.with_structured_output(UserReply)
     
     def chat(self, user_input: str):
+        if self.waiting_for_answer:
+            reply_prompt = (
+                f"Tutor asked: '{self.question}'\n"
+                f"Student replied: '{user_input}'\n"
+                "Analyze the student's reply. Is the student asking a new question or changing the topic?"
+                "Your ONLY job is to output the requested structured data. "
+                "DO NOT explain your reasoning. DO NOT generate any conversational text."
+            )
+            
+            try:
+                check_is_question = self.user_reply.invoke(reply_prompt)
+                if check_is_question.is_new_question:
+                    self.waiting_for_answer = False
+                    self.hint_counter = 0
+            except Exception as e:
+                print(f"[System Error]: {e}")
+
         if not self.waiting_for_answer:
             response = self.generate(user_input=user_input)
         else:
             response = self.evaluate_student(student_answer=user_input)
         
         self.update_history(user_input, response)
+
         return response
         
     def update_history(self, user_message, ai_message):
@@ -98,14 +122,14 @@ class TutorSystem:
             3. History
             4. English Grammar
             
-            If a student asks about anything outside of this four subjects especially coding related question in any language or
-            anything then refuse the request and tell the student that I have only knowledge of 4 subjects only maths science history and english grammer.
+            If a student asks about anything outside of this four subjects especially coding related question in any language or anything then 
+            refuse the request and tell the student that I have only knowledge of 4 subjects only maths science history and english grammar.
              
             Follow these Behavioral Guidelines:
             1. Identify the student's primary subject area.
             2. Retrieve verified information through tools.
             3. Provide perfect and focused explanations.
-            4. Answer only maths, science, history and english grammer questions. If student asks about anything else then tell the student your knowledge is in these 4 subjects only please ask questions from these subjects.
+            4. Answer only maths, science, history and english grammar questions. If student asks about anything else then tell the student your knowledge is in these 4 subjects only please ask questions from these subjects.
             5. Maintain a supportive, professional, and encouraging teaching style. 
             6. At last generate one question to solve the concept with the proper example without any hint as a question: question.   
             """),
@@ -118,14 +142,19 @@ class TutorSystem:
 
         self.agent_executor = AgentExecutor(agent=self.agent, tools=self.tools, verbose=False)
 
-        response = self.agent_executor.invoke({
-            "input": user_input,
-            "chat_history": self.chat_history
-        })
+        try:
+            response = self.agent_executor.invoke({
+                "input": user_input,
+                "chat_history": self.chat_history
+            })
         
-        self.question = response["output"]
-        self.waiting_for_answer = "Question:" or "question:" in self.question
-        return response["output"]
+            self.question = response["output"]
+            self.waiting_for_answer = "Question:" or "question:" in self.question
+            return response["output"]
+        
+        except Exception as e:
+            print(f"[System Error]: {e}")
+            return "Please resend the message after wait time"
     
     def evaluate_student(self, student_answer):
         eval_prompt = f"Question: {self.question}\nAnswer: {student_answer} Is this correct?"
@@ -153,14 +182,22 @@ class TutorSystem:
             self.hint_counter = 0
 
             solution_prompt = f"Question: {self.question} Give the full correct answer with proper explanation and Do NOT ask any new questions."
-            solution = self.model.invoke(solution_prompt).content
+            
+            try:
+                solution = self.model.invoke(solution_prompt).content
+            except Exception as e:
+                print(f"[System Error]: {e}")
 
             return f"Solution: {solution} \n\n What do you want to learn new?"
 
         hint_prompt = f"Question: {self.question}\nStudent said: {student_answer} (Wrong).\nInstruction: {hint_instruction}"
-        hint = self.model.invoke(hint_prompt).content
+        
+        try:
+            hint = self.model.invoke(hint_prompt).content
+        except Exception as e:
+                print(f"[System Error]: {e}")
 
-        return f"Not the right answer. {hint}"
+        return f"{hint}"
 
 if __name__ == "__main__":
     api_key = os.environ.get("GROQ_API_KEY")
