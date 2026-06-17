@@ -1,6 +1,7 @@
 import sys
 import os  
 from dotenv import load_dotenv
+from typing import Literal
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
@@ -35,6 +36,13 @@ class StudentQuestionEvaluation(BaseModel):
     is_correct: bool = Field(
         description="True ONLY if the question is strictly about Math, Science, History, or English. False if it asks for programming, coding or unrelated topics."
     )
+    subject: Literal["Math", "Science", "History", "English", "Other"] = Field(
+        description="The subject of the student's question."
+    )
+    resume_subject: bool = Field(
+        description="True if the user is simply asking to return to a previous subject(e.g.'history', 'math', 'science'). False if they are asking a specific new question."
+    )
+
 
 
 class Evaluation(BaseModel):
@@ -50,9 +58,32 @@ class UserReply(BaseModel):
 
 class TutorSystem:
     def __init__(self, api_key):
-        self.hint_counter = 0
-        self.waiting_for_answer = False
-        self.question = ""
+        self.hint_counter = {
+            "Math": 0,
+            "Science": 0,
+            "History": 0,
+            "English": 0,
+            "Other": 0
+        }
+
+        self.current_subject = "Other"
+        
+        self.active_questions = {
+            "Math": "", 
+            "Science": "", 
+            "History": "", 
+            "English": "", 
+            "Other": ""
+        }
+        
+        self.waiting_for_answer = {
+            "Math": False, 
+            "Science": False, 
+            "History": False, 
+            "English": False, 
+            "Other": False
+        }
+
         self.chat_history = []
 
         try:
@@ -73,9 +104,9 @@ class TutorSystem:
         self.user_reply = self.model.with_structured_output(UserReply)
     
     def chat(self, user_input: str):
-        if self.waiting_for_answer:
+        if self.waiting_for_answer[self.current_subject]:
             reply_prompt = (
-                f"Tutor asked: '{self.question}'\n"
+                f"Tutor asked: '{self.active_questions[self.current_subject]}'\n"
                 f"Student replied: '{user_input}'\n"
                 "Analyze the student's reply. Is the student asking a new question or changing the topic?"
                 "Your ONLY job is to output the requested structured data. "
@@ -85,12 +116,12 @@ class TutorSystem:
             try:
                 check_is_question = self.user_reply.invoke(reply_prompt)
                 if check_is_question.is_new_question:
-                    self.waiting_for_answer = False
-                    self.hint_counter = 0
+                    self.waiting_for_answer[self.current_subject] = False
+                    self.hint_counter[self.current_subject] = 0
             except Exception as e:
                 print(f"[System Error]: {e}")
 
-        if not self.waiting_for_answer:
+        if not self.waiting_for_answer[self.current_subject]:
             response = self.generate(user_input=user_input)
         else:
             response = self.evaluate_student(student_answer=user_input)
@@ -104,14 +135,28 @@ class TutorSystem:
         self.chat_history.append(AIMessage(content=ai_message))
 
     def generate(self, user_input: str):
-        check_prompt = f"Analyze this input: '{user_input}'. Is this a legitimate question about Math, Science, History, or English Grammar?"
+        check_prompt = f"Analyze this input: '{user_input}'. Is this a legitimate question about Math, Science, History, or English Grammar? Also identify the exact subject and if the user is just asking to resume."
         
         try:
             question_verify = self.question_verification.invoke(check_prompt)
-            if not question_verify.is_correct:
+            if not question_verify.is_correct and not question_verify.resume_subject:
                 return "I am a specialized tutor for Math, Science, History, and English Grammar only. I cannot answer questions or topics outside my expertise. What would you like to learn within my 4 subjects?"
+
+            new_subject = question_verify.subject
+            
+            if self.waiting_for_answer[new_subject]:
+                if question_verify.resume_subject:
+                    self.current_subject = new_subject
+                    return f"Resuming the {new_subject}\nQuestion: {self.active_questions[new_subject]}"
+                else:
+                    self.hint_counter[new_subject] = 0
+                    self.waiting_for_answer[new_subject] = False
+
+            self.current_subject = question_verify.subject
+            self.hint_counter[self.current_subject] = 0
+        
         except Exception:
-            is_valid = False
+            question_verify = StudentQuestionEvaluation(is_correct = False)
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", """
@@ -124,14 +169,15 @@ class TutorSystem:
             
             If a student asks about anything outside of this four subjects especially coding related question in any language or anything then 
             refuse the request and tell the student that I have only knowledge of 4 subjects only maths science history and english grammar.
-             
+            
             Follow these Behavioral Guidelines:
             1. Identify the student's primary subject area.
             2. Retrieve verified information through tools.
             3. Provide perfect and focused explanations.
             4. Answer only maths, science, history and english grammar questions. If student asks about anything else then tell the student your knowledge is in these 4 subjects only please ask questions from these subjects.
             5. Maintain a supportive, professional, and encouraging teaching style. 
-            6. At last generate one question to solve the concept with the proper example without any hint as a question: question.   
+            6. At last generate one question to solve the concept with the proper example without any hint as a question: question.  
+            7. If the student has answered the previous question and if it is wrong then just give the hint not the right answer. 
             """),
             MessagesPlaceholder(variable_name="chat_history"),
             ("user", "{input}"),
@@ -145,11 +191,12 @@ class TutorSystem:
         try:
             response = self.agent_executor.invoke({
                 "input": user_input,
-                "chat_history": self.chat_history
+                "chat_history"  : self.chat_history
             })
-        
-            self.question = response["output"]
-            self.waiting_for_answer = "Question:" or "question:" in self.question
+            output = response["output"]
+            self.active_questions[self.current_subject] = output
+
+            self.waiting_for_answer[self.current_subject] = "Question:" in output or "question:" in output
             return response["output"]
         
         except Exception as e:
@@ -157,7 +204,8 @@ class TutorSystem:
             return "Please resend the message after wait time"
     
     def evaluate_student(self, student_answer):
-        eval_prompt = f"Question: {self.question}\nAnswer: {student_answer} Is this correct?"
+        active_que = self.active_questions[self.current_subject]
+        eval_prompt = f"Question: {active_que}\nAnswer: {student_answer} Is this correct?"
         
         try:
             evaluation = self.evaluator_model.invoke(eval_prompt)
@@ -165,32 +213,35 @@ class TutorSystem:
             evaluation = Evaluation(is_correct=False, reason="Error")
 
         if evaluation.is_correct:
-            self.waiting_for_answer = False
-            self.hint_counter = 0
-            return f"Correct Answer!\n{evaluation.reason} \n\n What do you want to learn new?"
+            self.waiting_for_answer[self.current_subject] = False
+            self.hint_counter[self.current_subject] = 0
+            self.active_questions[self.current_subject] = ""
+
+            return f"Correct Answer!\n{evaluation.reason} \n\nWhat do you want to learn new?"
         
-        self.hint_counter += 1
+        self.hint_counter[self.current_subject] += 1
         
-        if self.hint_counter == 1:
+        if self.hint_counter[self.current_subject] == 1:
             hint_instruction = "Give a HARD hint. Just a tiny clue. Do not say the answer."
-        elif self.hint_counter == 2:
+        elif self.hint_counter[self.current_subject] == 2:
             hint_instruction = "Give a MEDIUM hint. Give the user the right logic. Do not say the answer."
-        elif self.hint_counter == 3:
+        elif self.hint_counter[self.current_subject] == 3:
             hint_instruction = "Give an EASY hint. Give almost all the steps and nearby answer. Do not say the answer."
         else:
-            self.waiting_for_answer = False
-            self.hint_counter = 0
+            self.waiting_for_answer[self.current_subject] = False
+            self.hint_counter[self.current_subject] = 0
+            self.active_questions[self.current_subject] = ""
 
-            solution_prompt = f"Question: {self.question} Give the full correct answer with proper explanation and Do NOT ask any new questions."
+            solution_prompt = f"Question: {active_que} Give the full correct answer with proper explanation and Do NOT ask any new questions."
             
             try:
                 solution = self.model.invoke(solution_prompt).content
             except Exception as e:
                 print(f"[System Error]: {e}")
-
+            self.active_questions[self.current_subject] = ""
             return f"Solution: {solution} \n\n What do you want to learn new?"
 
-        hint_prompt = f"Question: {self.question}\nStudent said: {student_answer} (Wrong).\nInstruction: {hint_instruction}"
+        hint_prompt = f"Question: {self.active_questions[self.current_subject]}\nStudent said: {student_answer} (Wrong).\nInstruction: {hint_instruction}"
         
         try:
             hint = self.model.invoke(hint_prompt).content
@@ -211,6 +262,9 @@ if __name__ == "__main__":
     while True:
         try:
             print("[System]: For exiting the conversation press 0 and enter.\n")
+            print(f"Subject: {tutor_system.current_subject}")
+            print(f"Hint: {tutor_system.hint_counter[tutor_system.current_subject]}")
+
             user_input = input("[Student]: ")
             if user_input == "0":
                 print("\n[System]: Thank you for using our AI Tutor System")
