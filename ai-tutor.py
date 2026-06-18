@@ -1,5 +1,6 @@
 import sys
 import os  
+import logging
 from dotenv import load_dotenv
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -10,6 +11,15 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
 load_dotenv()
+
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(filename="logs/report.log",
+                    format='%(asctime)s %(levelname)s: %(message)s',
+                    filemode='a')
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
 
 @tool
 def math(query: str):
@@ -42,7 +52,6 @@ class StudentQuestionEvaluation(BaseModel):
     resume_subject: bool = Field(
         description="True if the user is simply asking to return to a previous subject(e.g.'history', 'math', 'science'). False if they are asking a specific new question."
     )
-
 
 
 class Evaluation(BaseModel):
@@ -104,6 +113,21 @@ class TutorSystem:
         self.user_reply = self.model.with_structured_output(UserReply)
     
     def chat(self, user_input: str):
+        logger.info(f"message received from user: {user_input}")
+
+        switched_subj = self.handle_subject_switch(user_input)
+
+        if switched_subj:
+            self.current_subject = switched_subj
+            if self.waiting_for_answer[switched_subj]:
+                response = f"[System: Resuming {switched_subj} - Question: {self.active_questions[switched_subj]}"
+            else:
+                response = f"[System: Switched to {switched_subj}] What would you like to ask?"
+            
+            self.update_history(user_input, response)
+            return response
+ 
+        is_new = False
         if self.waiting_for_answer[self.current_subject]:
             reply_prompt = (
                 f"Tutor asked: '{self.active_questions[self.current_subject]}'\n"
@@ -116,12 +140,12 @@ class TutorSystem:
             try:
                 check_is_question = self.user_reply.invoke(reply_prompt)
                 if check_is_question.is_new_question:
-                    self.waiting_for_answer[self.current_subject] = False
-                    self.hint_counter[self.current_subject] = 0
+                    logger.info(f"new question arrived from user: {user_input}")
+                    is_new = True
             except Exception as e:
                 print(f"[System Error]: {e}")
 
-        if not self.waiting_for_answer[self.current_subject]:
+        if not self.waiting_for_answer[self.current_subject] or is_new:
             response = self.generate(user_input=user_input)
         else:
             response = self.evaluate_student(student_answer=user_input)
@@ -129,12 +153,29 @@ class TutorSystem:
         self.update_history(user_input, response)
 
         return response
+    
+    def handle_subject_switch(self, user_input):
+        input = user_input.strip().lower()
+
+        subjects = {
+            "math": "Math",
+            "maths": "Math",
+            "science": "Science",
+            "history": "History",
+            "english": "English"
+        }
+
+        if input in subjects:
+            return subjects[input]
         
+        return None
+
     def update_history(self, user_message, ai_message):
         self.chat_history.append(HumanMessage(content=user_message))
         self.chat_history.append(AIMessage(content=ai_message))
 
     def generate(self, user_input: str):
+        logger.info(f"question switched or created new")
         check_prompt = f"Analyze this input: '{user_input}'. Is this a legitimate question about Math, Science, History, or English Grammar? Also identify the exact subject and if the user is just asking to resume."
         
         try:
@@ -143,9 +184,11 @@ class TutorSystem:
                 return "I am a specialized tutor for Math, Science, History, and English Grammar only. I cannot answer questions or topics outside my expertise. What would you like to learn within my 4 subjects?"
 
             new_subject = question_verify.subject
-            
+            logger.info(f"New Subject: {new_subject}")
             if self.waiting_for_answer[new_subject]:
+                logger.info(f"waiting for answer")
                 if question_verify.resume_subject:
+                    logger.info(f"resume new subject")
                     self.current_subject = new_subject
                     return f"Resuming the {new_subject}\nQuestion: {self.active_questions[new_subject]}"
                 else:
@@ -153,10 +196,11 @@ class TutorSystem:
                     self.waiting_for_answer[new_subject] = False
 
             self.current_subject = question_verify.subject
+            logger.info(f"new subject {self.current_subject}")
             self.hint_counter[self.current_subject] = 0
         
-        except Exception:
-            question_verify = StudentQuestionEvaluation(is_correct = False)
+        except Exception as e:
+            print(f"[System Error]: {e}")
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", """
@@ -176,8 +220,8 @@ class TutorSystem:
             3. Provide perfect and focused explanations.
             4. Answer only maths, science, history and english grammar questions. If student asks about anything else then tell the student your knowledge is in these 4 subjects only please ask questions from these subjects.
             5. Maintain a supportive, professional, and encouraging teaching style. 
-            6. At last generate one question to solve the concept with the proper example without any hint as a question: question.  
-            7. If the student has answered the previous question and if it is wrong then just give the hint not the right answer. 
+            6. If the student has answered the previous question and if it is wrong then just give the hint not the right answer. 
+            7. At last generate one question to solve the concept with the proper example without any hint as a question: question.  
             """),
             MessagesPlaceholder(variable_name="chat_history"),
             ("user", "{input}"),
@@ -196,7 +240,7 @@ class TutorSystem:
             output = response["output"]
             self.active_questions[self.current_subject] = output
 
-            self.waiting_for_answer[self.current_subject] = "Question:" in output or "question:" in output
+            self.waiting_for_answer[self.current_subject] = "question" in output.lower()
             return response["output"]
         
         except Exception as e:
@@ -264,6 +308,7 @@ if __name__ == "__main__":
             print("[System]: For exiting the conversation press 0 and enter.\n")
             print(f"Subject: {tutor_system.current_subject}")
             print(f"Hint: {tutor_system.hint_counter[tutor_system.current_subject]}")
+            print(f"Waiting for answer: {tutor_system.waiting_for_answer}")
 
             user_input = input("[Student]: ")
             if user_input == "0":
