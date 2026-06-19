@@ -1,6 +1,8 @@
 import sys
-import os  
+import os 
+import uuid 
 import logging
+import psycopg2
 from dotenv import load_dotenv
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -19,6 +21,67 @@ logging.basicConfig(filename="logs/report.log",
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
+
+class DatabaseManager:
+    def __init__(self):
+        self.host = os.environ.get("DB_HOST")
+        self.database = os.environ.get("DB_NAME")
+        self.user = os.environ.get("DB_USER")
+        self.password = os.environ.get("DB_PASS")
+
+        try:
+            self.connection = psycopg2.connect(
+                host=self.host,
+                database=self.database,
+                user=self.user,
+                password=self.password
+            )
+            self.create_table()
+            logger.info("Successfully connected to PostgreSQL database.")
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            print(f"\n[Warning]: Could not connect to PostgreSQL.\n[Error]: {e}\n")
+            self.connection = None
+        
+    def create_table(self):
+        query = """
+        CREATE TABLE IF NOT EXISTS student_report (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(50) NOT NULL,
+            subject VARCHAR(50) NOT NULL,
+            question TEXT NOT NULL,
+            result VARCHAR(50) NOT NULL,
+            hints INTEGER NOT NULL,
+            timestamp TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """
+        with self.connection.cursor() as cursor:
+            cursor.execute(query)
+            self.connection.commit()
+    
+    def record_chat(self, session_id, subject, question, result, hints_used):
+        query = """
+        INSERT INTO student_report (session_id, subject, question, result, hints)
+        VALUES (%s, %s, %s, %s, %s);
+        """
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(query, (session_id, subject, question, result, hints_used))
+                self.connection.commit()
+        except Exception as e:
+            logger.error(f"Failed to insert record: {e}")
+    
+    def get_session_details(self, session_id):
+        query = "SELECT subject, question, result, hints FROM student_report WHERE session_id = %s;"
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(query,(session_id,))
+                user_data = cursor.fetchall()
+                return user_data
+        except Exception as e:
+            logger.error(f"Failed to fetch: {e}")
+            return []
 
 
 @tool
@@ -67,6 +130,9 @@ class UserReply(BaseModel):
 
 class TutorSystem:
     def __init__(self, api_key):
+        self.session_id = str(uuid.uuid4())
+        self.db = DatabaseManager()
+
         self.hint_counter = {
             "Math": 0,
             "Science": 0,
@@ -100,7 +166,7 @@ class TutorSystem:
                 model="openai/gpt-oss-120b", 
                 temperature=0.3,
                 api_key=api_key,
-                max_tokens=2000,
+                max_tokens=4000,
             )
 
         except Exception as e:
@@ -257,6 +323,14 @@ class TutorSystem:
             evaluation = Evaluation(is_correct=False, reason="Error")
 
         if evaluation.is_correct:
+            self.db.record_chat(
+                session_id=self.session_id, 
+                subject=self.current_subject, 
+                question=active_que, 
+                result="Correct Answer", 
+                hints_used=self.hint_counter[self.current_subject]
+            )
+
             self.waiting_for_answer[self.current_subject] = False
             self.hint_counter[self.current_subject] = 0
             self.active_questions[self.current_subject] = ""
@@ -267,11 +341,43 @@ class TutorSystem:
         
         if self.hint_counter[self.current_subject] == 1:
             hint_instruction = "Give a HARD hint. Just a tiny clue. Do not say the answer."
+            self.db.record_chat(
+                session_id=self.session_id, 
+                subject=self.current_subject, 
+                question=active_que, 
+                result="Wrong Answer", 
+                hints_used=self.hint_counter[self.current_subject]
+            )
+
         elif self.hint_counter[self.current_subject] == 2:
             hint_instruction = "Give a MEDIUM hint. Give the user the right logic. Do not say the answer."
+            self.db.record_chat(
+                session_id=self.session_id, 
+                subject=self.current_subject, 
+                question=active_que, 
+                result="Wrong Answer", 
+                hints_used=self.hint_counter[self.current_subject]
+            )
+
         elif self.hint_counter[self.current_subject] == 3:
             hint_instruction = "Give an EASY hint. Give almost all the steps and nearby answer. Do not say the answer."
+            self.db.record_chat(
+                session_id=self.session_id, 
+                subject=self.current_subject, 
+                question=active_que, 
+                result="Wrong Answer", 
+                hints_used=self.hint_counter[self.current_subject]
+            )
+
         else:
+            self.db.record_chat(
+                session_id=self.session_id, 
+                subject=self.current_subject, 
+                question=active_que, 
+                result="Wrong Answer", 
+                hints_used=self.hint_counter[self.current_subject]
+            )
+
             self.waiting_for_answer[self.current_subject] = False
             self.hint_counter[self.current_subject] = 0
             self.active_questions[self.current_subject] = ""
@@ -293,6 +399,35 @@ class TutorSystem:
                 print(f"[System Error]: {e}")
 
         return f"{hint}"
+    
+    def generate_report(self): 
+        data = self.db.get_session_details(session_id=self.session_id)
+        if not data:
+            return "No questions found!"
+        
+        report_prompt = f"""
+        You are an expert Educational Evaluator. Based on the following questions and answers , generate a performance report for the student.
+
+        Student Metrics:
+        {data}
+        Requirements:
+        1. Summarize their performance across the subjects they attempted.
+        2. Provide feedback on their reliance on hints.
+        3. If there are multiple questions and the question is repeated then consider ther question as 1 question and count as its attempts.
+        4. Calculate a final numerical score out of 100 based on their 'Result' if Result is Correct Answer then the user has given the answer 
+        correct if Wrong answer then user has given wrong answer if less hints used then that is good and more hints used then that is not good. 
+        5. If same question has multiple hints that means user is attempting to answer but giving the wrong answers.
+        6. Make the report professional, constructive, and visually clear
+        7. Do NOT ask any follow-up questions or any other questions.
+        """
+        
+        try:
+            report = self.model.invoke(report_prompt).content
+            return report
+        except Exception as e:
+            print(f"[System Error]: {e}")
+            return f"Failed to generate report: {e}"
+    
 
 if __name__ == "__main__":
     api_key = os.environ.get("GROQ_API_KEY")
@@ -306,6 +441,7 @@ if __name__ == "__main__":
     while True:
         try:
             print("[System]: For exiting the conversation press 0 and enter.\n")
+            print("[System]: For generating the report write 'report' and enter.\n")
             print(f"Subject: {tutor_system.current_subject}")
             print(f"Hint: {tutor_system.hint_counter[tutor_system.current_subject]}")
             print(f"Waiting for answer: {tutor_system.waiting_for_answer}")
@@ -315,6 +451,12 @@ if __name__ == "__main__":
                 print("\n[System]: Thank you for using our AI Tutor System")
                 print("\n=== Exiting Tutor System. ===")
                 break
+            elif user_input == "report":
+                print("\n[System]: Generating Student Report Using our AI Tutor System")
+                report = tutor_system.generate_report()
+                print(report)
+                continue
+
             answer = tutor_system.chat(user_input=user_input)
             print(f"\n[Tutor]: {answer}\n")
         except KeyboardInterrupt:
